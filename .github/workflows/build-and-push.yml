@@ -1,0 +1,31 @@
+---
+name: Build and Push Docker Image
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency: production_environment
+
+jobs:
+  build:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Log in to ghcr.io with docker
+        run: echo ${{ secrets.PAT }} | docker login ghcr.io -u shoogland --password-stdin
+
+      - name: Build docker image
+        run: |
+          docker build . \
+          --tag "ghcr.io/shoogland/k8s-node-ip-watcher:$GITHUB_SHA" \
+          --tag "ghcr.io/shoogland/k8s-node-ip-watcher:latest" \
+
+      - name: Push to GitHub Packages with latest tag
+        run: docker push ghcr.io/shoogland/k8s-node-ip-watcher:latest
+
+      - name: Push to GitHub Packages with sha tag
+        run: docker push "ghcr.io/shoogland/k8s-node-ip-watcher:$GITHUB_SHA"
