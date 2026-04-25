@@ -86,10 +86,9 @@ def atlas_remove(ip):
 
 
 # --- K8s helpers ---
-
 def get_node_ip(node):
     for addr in (node.status.addresses or []):
-        if addr.type == "InternalIP":
+        if addr.type == "ExternalIP":
             return addr.address
     return None
 
