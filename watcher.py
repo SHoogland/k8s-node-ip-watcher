@@ -4,33 +4,59 @@ import time
 import logging
 import threading
 import requests
-from requests.auth import HTTPDigestAuth
 from kubernetes import client, config, watch
+from base64 import b64encode
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger(__name__)
 
 # Atlas config from env vars
-PROJECT_ID  = os.environ["ATLAS_PROJECT_ID"]
-PUBLIC_KEY  = os.environ["ATLAS_PUBLIC_KEY"]
-PRIVATE_KEY = os.environ["ATLAS_PRIVATE_KEY"]
-COMMENT_TAG = os.environ.get("ATLAS_COMMENT_TAG", "k8s-node")
+CLIENT_ID     = os.environ["ATLAS_CLIENT_ID"]
+CLIENT_SECRET = os.environ["ATLAS_CLIENT_SECRET"]
+PROJECT_ID    = os.environ["ATLAS_PROJECT_ID"]
+COMMENT_TAG   = os.environ.get("ATLAS_COMMENT_TAG", "k8s-node")
 
-ATLAS_BASE = f"https://cloud.mongodb.com/api/atlas/v1.0/groups/{PROJECT_ID}/accessList"
-AUTH = HTTPDigestAuth(PUBLIC_KEY, PRIVATE_KEY)
+ATLAS_BASE  = f"https://cloud.mongodb.com/api/atlas/v2/groups/{PROJECT_ID}/accessList"
+TOKEN_URL   = "https://cloud.mongodb.com/api/oauth/token"
+API_VERSION = "application/vnd.atlas.2025-03-12+json"
 
+# --- Token management ---
+
+_token = None
+_token_expiry = 0
+
+def get_token():
+    global _token, _token_expiry
+    if time.time() < _token_expiry - 60:  # refresh 1 min before expiry
+        return _token
+    
+    credentials = b64encode(f"{CLIENT_ID}:{CLIENT_SECRET}".encode()).decode().strip()
+    r = requests.post(TOKEN_URL,
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json"
+        },
+        data="grant_type=client_credentials"
+    )
+    r.raise_for_status()
+    data = r.json()
+    _token = data["access_token"]
+    _token_expiry = time.time() + data["expires_in"]
+    return _token
+
+def auth_headers():
+    return {
+        "Authorization": f"Bearer {get_token()}",
+        "Accept": API_VERSION,
+        "Content-Type": "application/json"
+    }
 
 # --- Atlas API helpers ---
 
-def atlas_list():
-    """Returns set of all IP addresses in Atlas allowlist"""
-    r = requests.get(ATLAS_BASE, auth=AUTH)
-    r.raise_for_status()
-    return {e["ipAddress"] for e in r.json().get("results", [])}
-
 def atlas_list_k8s_tagged():
     """Returns set of IP addresses in Atlas allowlist that are tagged as k8s nodes"""
-    r = requests.get(ATLAS_BASE, auth=AUTH)
+    r = requests.get(ATLAS_BASE, headers=auth_headers())
     r.raise_for_status()
     k8s_ips = set()
     for entry in r.json().get("results", []):
@@ -41,7 +67,7 @@ def atlas_list_k8s_tagged():
 
 def atlas_add(ip, node_name):
     entry = f"{ip}/32"
-    r = requests.post(ATLAS_BASE, auth=AUTH,
+    r = requests.post(ATLAS_BASE, headers=auth_headers(),
         json=[{"ipAddress": entry, "comment": f"{COMMENT_TAG}/{node_name}"}])
     if r.status_code == 409:
         log.info(f"IP {entry} already in Atlas allowlist, skipping")
@@ -50,8 +76,8 @@ def atlas_add(ip, node_name):
     log.info(f"Added {entry} ({node_name}) to Atlas allowlist")
 
 def atlas_remove(ip):
-    entry = f"{ip}/32"
-    r = requests.delete(f"{ATLAS_BASE}/{entry}", auth=AUTH)
+    entry = requests.utils.quote(f"{ip}/32", safe="")
+    r = requests.delete(f"{ATLAS_BASE}/{entry}", headers=auth_headers())
     if r.status_code == 404:
         log.info(f"IP {entry} not in Atlas allowlist, skipping")
         return
@@ -70,34 +96,29 @@ def get_node_ip(node):
 def list_all_node_ips():
     v1 = client.CoreV1Api()
     nodes = v1.list_node()
-    return {get_node_ip(n) for n in nodes.items if get_node_ip(n)}
-
-
-# --- Reconciliation loop ---
+    return {get_node_ip(n): n.metadata.name 
+        for n in nodes.items if get_node_ip(n)}
 
 def reconcile():
     while True:
         try:
-            k8s_ips = list_all_node_ips()
-            atlas_all_ips = atlas_list()
-            atlas_k8s_ips = atlas_list_k8s_tagged()
+            k8s_ip_map = list_all_node_ips()  # {ip: node_name}
+            k8s_ips = set(k8s_ip_map.keys())
+            atlas_k8s_ips = atlas_list_k8s_tagged()  # only tagged IPs
 
-            # Add missing k8s IPs to Atlas
-            for ip in k8s_ips - atlas_all_ips:
+            for ip in k8s_ips - atlas_k8s_ips:
                 log.warning(f"Reconcile: {ip} missing from Atlas, adding")
-                atlas_add(ip, "reconciled")
+                atlas_add(ip, k8s_ip_map[ip])
 
-            # Remove stale k8s-tagged IPs from Atlas (only those tagged as k8s nodes)
             for ip in atlas_k8s_ips - k8s_ips:
-                log.warning(f"Reconcile: {ip} stale k8s-tagged IP in Atlas, removing")
+                log.warning(f"Reconcile: {ip} stale in Atlas, removing")
                 atlas_remove(ip)
 
             log.info("Reconcile complete")
         except Exception as e:
             log.error(f"Reconcile error: {e}")
 
-        time.sleep(300)  # every 5 minutes
-
+        time.sleep(300)
 
 # --- Event watcher ---
 
